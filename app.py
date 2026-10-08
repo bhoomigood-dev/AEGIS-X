@@ -13,12 +13,13 @@ from google import genai
 from streamlit_webrtc import webrtc_streamer
 from ultralytics import YOLO
 
-# Task 5 edge-case module
 from edge_cases import run_edge_case
 
 
 # ============================================================
-# AEGIS-X CONFIGURATION
+# AEGIS-X
+# AI Emergency & Geographic Intelligence System
+# Detect. Understand. Respond.
 # ============================================================
 
 st.set_page_config(
@@ -40,6 +41,31 @@ VEHICLES = {
 
 
 # ============================================================
+# GEMINI API KEY
+# ============================================================
+
+def get_gemini_key():
+    """
+    Read Gemini key from Streamlit Cloud Secrets first.
+    Fall back to local .env for local development.
+    """
+
+    try:
+        key = st.secrets.get("GEMINI_API_KEY")
+
+        if key:
+            return key
+
+    except Exception:
+        pass
+
+    return os.getenv("GEMINI_API_KEY")
+
+
+GEMINI_API_KEY = get_gemini_key()
+
+
+# ============================================================
 # LOAD YOLO26n
 # ============================================================
 
@@ -52,7 +78,7 @@ model = load_model()
 
 
 # ============================================================
-# AEGIS SHARED STATE
+# SHARED AEGIS STATE
 # ============================================================
 
 class AEGISState:
@@ -61,12 +87,15 @@ class AEGISState:
 
         self.lock = threading.Lock()
 
+        # Recent positions for tracked vehicles
         self.history = defaultdict(
             lambda: deque(maxlen=8)
         )
 
+        # Persistent overlap between tracked vehicles
         self.overlap_frames = defaultdict(int)
 
+        # Live values
         self.vehicle_count = 0
         self.stopped_count = 0
         self.risk = 0
@@ -79,7 +108,9 @@ class AEGISState:
 
 
 if "aegis_state" not in st.session_state:
+
     st.session_state.aegis_state = AEGISState()
+
 
 state = st.session_state.aegis_state
 
@@ -141,7 +172,7 @@ def calculate_iou(box1, box2):
 
 
 # ============================================================
-# LIVE CAMERA PROCESSING
+# LIVE CAMERA CALLBACK
 # ============================================================
 
 def video_frame_callback(frame):
@@ -169,6 +200,7 @@ def video_frame_callback(frame):
         with state.lock:
 
             state.status = "PROCESSING ERROR"
+
             state.reason = (
                 f"Vision processing failed: {error}"
             )
@@ -185,7 +217,7 @@ def video_frame_callback(frame):
     vehicles = []
 
     # --------------------------------------------------------
-    # COLLECT TRACKED VEHICLES
+    # READ TRACKED VEHICLES
     # --------------------------------------------------------
 
     if (
@@ -241,7 +273,7 @@ def video_frame_callback(frame):
     vehicle_count = len(vehicles)
 
     # --------------------------------------------------------
-    # STOPPED VEHICLES
+    # STOPPED VEHICLE DETECTION
     # --------------------------------------------------------
 
     stopped_count = 0
@@ -267,10 +299,11 @@ def video_frame_callback(frame):
                 )
 
             if movement < 25:
+
                 stopped_count += 1
 
     # --------------------------------------------------------
-    # PERSISTENT VEHICLE OVERLAP
+    # POSSIBLE COLLISION
     # --------------------------------------------------------
 
     collision_detected = False
@@ -286,7 +319,9 @@ def video_frame_callback(frame):
             id2 = vehicles[j]["id"]
 
             pair = tuple(
-                sorted((id1, id2))
+                sorted(
+                    (id1, id2)
+                )
             )
 
             overlap = calculate_iou(
@@ -311,6 +346,7 @@ def video_frame_callback(frame):
     # --------------------------------------------------------
 
     risk = 0
+
     reasons = []
 
     if vehicle_count >= 4:
@@ -351,7 +387,7 @@ def video_frame_callback(frame):
     )
 
     # --------------------------------------------------------
-    # SEVERITY ENGINE
+    # SEVERITY
     # --------------------------------------------------------
 
     if risk >= 70:
@@ -393,7 +429,7 @@ def video_frame_callback(frame):
         )
 
     # --------------------------------------------------------
-    # UPDATE STATE
+    # UPDATE LIVE STATE
     # --------------------------------------------------------
 
     with state.lock:
@@ -406,10 +442,10 @@ def video_frame_callback(frame):
         state.reason = reason
 
     # --------------------------------------------------------
-    # VIDEO OVERLAY
+    # DRAW INFORMATION ON VIDEO
     # --------------------------------------------------------
 
-    overlay_lines = [
+    lines = [
         "AEGIS-X",
         f"Vehicles: {vehicle_count}",
         f"Stopped: {stopped_count}",
@@ -420,9 +456,7 @@ def video_frame_callback(frame):
 
     y = 35
 
-    for index, line in enumerate(
-        overlay_lines
-    ):
+    for index, line in enumerate(lines):
 
         cv2.putText(
             output,
@@ -443,7 +477,7 @@ def video_frame_callback(frame):
 
 
 # ============================================================
-# ROUTE ENGINE
+# ROUTING ENGINE
 # ============================================================
 
 def build_route_map():
@@ -482,7 +516,14 @@ def build_route_map():
         weight="weight",
     )
 
-    # Prototype blocked road
+    normal_distance = nx.shortest_path_length(
+        graph,
+        source,
+        destination,
+        weight="weight",
+    )
+
+    # Block B-C
     blocked_road = ("B", "C")
 
     if graph.has_edge(
@@ -497,6 +538,13 @@ def build_route_map():
 
     # Alternative route
     alternative_route = nx.shortest_path(
+        graph,
+        source,
+        destination,
+        weight="weight",
+    )
+
+    alternative_distance = nx.shortest_path_length(
         graph,
         source,
         destination,
@@ -653,13 +701,15 @@ def build_route_map():
     return (
         fig,
         normal_route,
+        normal_distance,
         alternative_route,
+        alternative_distance,
         blocked_road,
     )
 
 
 # ============================================================
-# GEMINI AI
+# GEMINI AI INCIDENT REPORT
 # ============================================================
 
 def generate_ai_report(
@@ -673,16 +723,13 @@ def generate_ai_report(
     alternative_route,
 ):
 
-    api_key = os.getenv(
-        "GEMINI_API_KEY"
-    )
+    api_key = get_gemini_key()
 
     if not api_key:
 
         return (
             None,
-            "GEMINI_API_KEY not found. "
-            "Check your .env file."
+            "GEMINI_API_KEY not found."
         )
 
     prompt = f"""
@@ -700,7 +747,7 @@ Reason: {reason}
 Blocked Road: {blocked_road}
 Alternative Route: {alternative_route}
 
-Create a concise incident intelligence report.
+Generate a concise incident intelligence report.
 
 Include:
 
@@ -714,7 +761,7 @@ Rules:
 - Use only the supplied information.
 - Do not invent casualties.
 - Do not invent locations.
-- Do not invent sensor readings.
+- Do not invent sensor values.
 - Do not invent facts.
 - Do not make medical decisions.
 - Do not make safety-critical decisions.
@@ -727,59 +774,70 @@ Rules:
             api_key=api_key
         )
 
-        # Retry temporary Gemini service failures
-        for attempt in range(3):
+        models = [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+        ]
 
-            try:
+        last_error = None
 
-                response = (
-                    client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=prompt,
+        for model_name in models:
+
+            for attempt in range(3):
+
+                try:
+
+                    response = (
+                        client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                        )
                     )
-                )
-
-                return (
-                    response.text,
-                    None,
-                )
-
-            except Exception as error:
-
-                error_text = str(error)
-
-                if (
-                    "503" in error_text
-                    or
-                    "UNAVAILABLE" in error_text
-                ):
-
-                    time.sleep(
-                        2 ** attempt
-                    )
-
-                else:
 
                     return (
+                        response.text,
                         None,
-                        error_text,
                     )
+
+                except Exception as error:
+
+                    last_error = error
+
+                    error_text = str(error)
+
+                    # Retry temporary service errors
+                    if (
+                        "503" in error_text
+                        or
+                        "UNAVAILABLE" in error_text
+                    ):
+
+                        time.sleep(
+                            2 ** attempt
+                        )
+
+                    else:
+
+                        break
+
+            # Try next model if first model failed
 
         return (
             None,
-            "Gemini service is temporarily unavailable."
+            f"Gemini temporarily unavailable: {last_error}"
         )
 
     except Exception as error:
 
         return (
             None,
-            str(error),
+            str(error)
         )
 
 
 # ============================================================
-# HEADER
+# PAGE HEADER
 # ============================================================
 
 st.title("🚨 AEGIS-X")
@@ -800,7 +858,7 @@ st.write(
 
 
 # ============================================================
-# SIDEBAR — SYSTEM STATUS
+# SIDEBAR
 # ============================================================
 
 st.sidebar.title(
@@ -827,7 +885,7 @@ st.sidebar.success(
     "Route Engine — READY"
 )
 
-if os.getenv("GEMINI_API_KEY"):
+if get_gemini_key():
 
     st.sidebar.success(
         "Gemini AI — READY"
@@ -838,11 +896,6 @@ else:
     st.sidebar.error(
         "Gemini AI — API KEY MISSING"
     )
-
-
-# ============================================================
-# PRIMARY / BACKUP INPUT
-# ============================================================
 
 st.sidebar.markdown("---")
 
@@ -864,7 +917,22 @@ st.sidebar.write(
 
 
 # ============================================================
-# REVIEW 3 — TASK 5 EDGE-CASE TEST
+# WEBRTC CONFIGURATION
+# ============================================================
+
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302"
+            ]
+        }
+    ]
+}
+
+
+# ============================================================
+# REVIEW 3 — TASK 5
 # ============================================================
 
 st.sidebar.markdown("---")
@@ -884,11 +952,9 @@ edge_case = st.sidebar.selectbox(
     ],
 )
 
-run_edge_test = st.sidebar.button(
+if st.sidebar.button(
     "Run Edge-Case Test"
-)
-
-if run_edge_test:
+):
 
     if edge_case == "Select test":
 
@@ -936,7 +1002,7 @@ if run_edge_test:
 
 
 # ============================================================
-# TABS
+# MAIN TABS
 # ============================================================
 
 tab_live, tab_map, tab_ai = st.tabs(
@@ -959,18 +1025,19 @@ with tab_live:
     )
 
     st.write(
-        "Start the browser camera. AEGIS-X detects "
-        "and tracks vehicles and calculates a "
-        "prototype incident risk."
+        "Start the browser camera. "
+        "AEGIS-X detects and tracks vehicles "
+        "and calculates a prototype incident risk."
     )
 
     # --------------------------------------------------------
-    # WebRTC
+    # Browser camera
     # --------------------------------------------------------
 
     webrtc_streamer(
         key="aegis-camera",
         video_frame_callback=video_frame_callback,
+        rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={
             "video": True,
             "audio": False,
@@ -981,7 +1048,7 @@ with tab_live:
     st.markdown("---")
 
     # --------------------------------------------------------
-    # LIVE METRICS
+    # Live metrics
     # --------------------------------------------------------
 
     @st.fragment(run_every="1s")
@@ -1002,28 +1069,28 @@ with tab_live:
 
             st.metric(
                 "Vehicles",
-                vehicle_count,
+                vehicle_count
             )
 
         with col2:
 
             st.metric(
                 "Stopped",
-                stopped_count,
+                stopped_count
             )
 
         with col3:
 
             st.metric(
                 "Risk Score",
-                f"{risk}/100",
+                f"{risk}/100"
             )
 
         with col4:
 
             st.metric(
                 "Severity",
-                severity,
+                severity
             )
 
         if status == "POSSIBLE INCIDENT":
@@ -1041,7 +1108,7 @@ with tab_live:
         elif status == "PROCESSING ERROR":
 
             st.error(
-                "❌ AEGIS-X processing error"
+                "❌ AEGIS-X PROCESSING ERROR"
             )
 
         else:
@@ -1057,7 +1124,7 @@ with tab_live:
     show_live_metrics()
 
     # --------------------------------------------------------
-    # CURRENT DECISION
+    # Current decision
     # --------------------------------------------------------
 
     st.markdown("---")
@@ -1115,15 +1182,16 @@ with tab_map:
     )
 
     st.write(
-        "The route engine maps a prototype incident "
-        "to an affected road and calculates an "
-        "alternative route."
+        "AEGIS-X identifies an affected road segment "
+        "and demonstrates alternative route selection."
     )
 
     (
         route_figure,
         normal_route,
+        normal_distance,
         alternative_route,
+        alternative_distance,
         blocked_road,
     ) = build_route_map()
 
@@ -1138,22 +1206,32 @@ with tab_map:
 
         st.metric(
             "Affected Road",
-            "B-C",
+            "B-C"
         )
 
     with col2:
 
         st.metric(
-            "Normal Route",
-            "A-B-C-D",
+            "Normal Distance",
+            str(normal_distance)
         )
 
     with col3:
 
         st.metric(
-            "Alternative Route",
-            "A-E-D",
+            "Alternative Distance",
+            str(alternative_distance)
         )
+
+    st.write(
+        "**Normal Route:** "
+        + " → ".join(normal_route)
+    )
+
+    st.write(
+        "**Alternative Route:** "
+        + " → ".join(alternative_route)
+    )
 
     st.success(
         "Incident scenario: B-C is blocked. "
@@ -1161,13 +1239,13 @@ with tab_map:
     )
 
     st.caption(
-        "Prototype road graph. "
-        "This is not live GPS navigation."
+        "Prototype digital road graph; "
+        "not live GPS navigation."
     )
 
 
 # ============================================================
-# TAB 3 — AI COMMANDER
+# TAB 3 — AI INCIDENT COMMANDER
 # ============================================================
 
 with tab_ai:
@@ -1178,11 +1256,11 @@ with tab_ai:
 
     st.write(
         "Gemini converts the deterministic AEGIS-X "
-        "decision into an explainable incident report."
+        "decision into an explainable response."
     )
 
     # --------------------------------------------------------
-    # LIVE INCIDENT STATE
+    # Current live state
     # --------------------------------------------------------
 
     with state.lock:
@@ -1195,14 +1273,13 @@ with tab_ai:
         live_reason = state.reason
 
     st.info(
-        f"Current live state: "
-        f"{live_status} | "
-        f"Risk {live_risk}/100 | "
-        f"Severity {live_severity}"
+        f"Live State: {live_status} | "
+        f"Risk: {live_risk}/100 | "
+        f"Severity: {live_severity}"
     )
 
     # --------------------------------------------------------
-    # AUTO-GENERATED INCIDENT DATA
+    # System-generated incident data
     # --------------------------------------------------------
 
     incident_text = (
@@ -1217,14 +1294,14 @@ with tab_ai:
     )
 
     st.text_area(
-        "System-generated incident data",
+        "System-generated Incident Data",
         value=incident_text,
         height=220,
         disabled=True,
     )
 
     # --------------------------------------------------------
-    # GENERATE AI RESPONSE
+    # Generate AI report
     # --------------------------------------------------------
 
     if st.button(
@@ -1233,7 +1310,7 @@ with tab_ai:
     ):
 
         with st.spinner(
-            "Generating incident response..."
+            "Generating incident intelligence..."
         ):
 
             report, error = generate_ai_report(
@@ -1263,20 +1340,69 @@ with tab_ai:
                 f"Gemini unavailable: {error}"
             )
 
+    # --------------------------------------------------------
+    # End-to-end architecture
+    # --------------------------------------------------------
+
+    st.markdown("---")
+
+    st.subheader(
+        "AEGIS-X End-to-End Flow"
+    )
+
+    st.markdown(
+        """
+        **INPUT**
+
+        🎥 Live Browser Camera
+
+        ↓
+
+        **PROCESSING**
+
+        YOLO26n + ByteTrack
+
+        ↓
+
+        **DECISION**
+
+        Incident Analysis + Risk + Severity
+
+        ↓
+
+        **GEOGRAPHIC ACTION**
+
+        Affected Road → Alternative Route
+
+        ↓
+
+        **GENERATIVE RESPONSE**
+
+        Gemini Incident Commander
+
+        ↓
+
+        **OUTPUT**
+
+        Explainable Emergency Intelligence Report
+        """
+    )
+
 
 # ============================================================
-# REVIEW 3 — TASK 5 EXPLANATION
+# REVIEW 3 — TASK 5 SUMMARY
 # ============================================================
 
 st.markdown("---")
 
 st.subheader(
-    "🛡️ Review 3 — Edge-Case Handling"
+    "🛡️ Review 3 — Task 5: Edge-Case Handling"
 )
 
 st.write(
-    "AEGIS-X uses safe-state, fallback, retry and "
-    "input-validation responses for abnormal conditions."
+    "AEGIS-X is designed to respond to abnormal "
+    "conditions using fallback, safe-state, retry "
+    "and input-validation behaviour."
 )
 
 col1, col2, col3, col4 = st.columns(4)
@@ -1311,7 +1437,7 @@ with col4:
 
 
 # ============================================================
-# FINAL STATUS
+# FOOTER
 # ============================================================
 
 st.markdown("---")
@@ -1329,12 +1455,12 @@ st.caption(
 )
 
 st.caption(
-    "AEGIS-X | AI Emergency & Geographic Intelligence System | "
+    "AI Emergency & Geographic Intelligence System | "
     "Detect. Understand. Respond."
 )
 
 st.caption(
-    "Prototype note: incident and routing rules are "
-    "deterministic prototype logic; Gemini provides "
-    "explanation and response text."
+    "Prototype note: incident and routing decisions "
+    "are deterministic prototype logic. Gemini is used "
+    "for explanation and response generation."
 )
