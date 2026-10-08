@@ -1,6 +1,6 @@
 import os
-import threading
 import time
+import threading
 from collections import defaultdict, deque
 
 import av
@@ -8,6 +8,7 @@ import cv2
 import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
+
 from dotenv import load_dotenv
 from google import genai
 from streamlit_webrtc import webrtc_streamer
@@ -31,6 +32,7 @@ st.set_page_config(
 load_dotenv()
 
 MODEL_PATH = "yolo26n.pt"
+DEMO_VIDEO = os.path.join("demo", "road.mp4")
 
 VEHICLES = {
     "car",
@@ -41,14 +43,11 @@ VEHICLES = {
 
 
 # ============================================================
-# GEMINI API KEY
+# GEMINI KEY
 # ============================================================
 
 def get_gemini_key():
-    """
-    Read Gemini key from Streamlit Cloud Secrets first.
-    Fall back to local .env for local development.
-    """
+    """Read Gemini key from Streamlit Cloud Secrets or .env."""
 
     try:
         key = st.secrets.get("GEMINI_API_KEY")
@@ -62,11 +61,8 @@ def get_gemini_key():
     return os.getenv("GEMINI_API_KEY")
 
 
-GEMINI_API_KEY = get_gemini_key()
-
-
 # ============================================================
-# LOAD YOLO26n
+# YOLO MODEL
 # ============================================================
 
 @st.cache_resource
@@ -78,7 +74,7 @@ model = load_model()
 
 
 # ============================================================
-# SHARED AEGIS STATE
+# SHARED STATE
 # ============================================================
 
 class AEGISState:
@@ -87,24 +83,25 @@ class AEGISState:
 
         self.lock = threading.Lock()
 
-        # Recent positions for tracked vehicles
         self.history = defaultdict(
             lambda: deque(maxlen=8)
         )
 
-        # Persistent overlap between tracked vehicles
         self.overlap_frames = defaultdict(int)
 
-        # Live values
+        # Live camera values
         self.vehicle_count = 0
         self.stopped_count = 0
         self.risk = 0
         self.severity = "LOW"
         self.status = "NORMAL"
-
         self.reason = (
             "No abnormal traffic behaviour detected"
         )
+
+        # Demo-video result
+        self.demo_result = None
+        self.demo_frame = None
 
 
 if "aegis_state" not in st.session_state:
@@ -116,7 +113,7 @@ state = st.session_state.aegis_state
 
 
 # ============================================================
-# GEOMETRY FUNCTIONS
+# GEOMETRY
 # ============================================================
 
 def center_of(box):
@@ -146,21 +143,40 @@ def calculate_iou(box1, box2):
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
 
-    width = max(0, x2 - x1)
-    height = max(0, y2 - y1)
+    width = max(
+        0,
+        x2 - x1
+    )
+
+    height = max(
+        0,
+        y2 - y1
+    )
 
     intersection = width * height
 
     area1 = (
-        max(0, box1[2] - box1[0])
+        max(
+            0,
+            box1[2] - box1[0]
+        )
         *
-        max(0, box1[3] - box1[1])
+        max(
+            0,
+            box1[3] - box1[1]
+        )
     )
 
     area2 = (
-        max(0, box2[2] - box2[0])
+        max(
+            0,
+            box2[2] - box2[0]
+        )
         *
-        max(0, box2[3] - box2[1])
+        max(
+            0,
+            box2[3] - box2[1]
+        )
     )
 
     union = area1 + area2 - intersection
@@ -172,6 +188,98 @@ def calculate_iou(box1, box2):
 
 
 # ============================================================
+# RISK CALCULATION
+# ============================================================
+
+def calculate_risk(
+    vehicle_count,
+    stopped_count,
+    collision_detected=False,
+):
+
+    risk = 0
+    reasons = []
+
+    if vehicle_count >= 4:
+
+        risk += 20
+
+        reasons.append(
+            "High vehicle density"
+        )
+
+    if vehicle_count >= 6:
+
+        risk += 15
+
+        reasons.append(
+            "Heavy traffic"
+        )
+
+    if stopped_count > 0:
+
+        risk += stopped_count * 10
+
+        reasons.append(
+            "Stopped vehicle detected"
+        )
+
+    if collision_detected:
+
+        risk += 40
+
+        reasons.append(
+            "Persistent vehicle overlap"
+        )
+
+    risk = min(
+        risk,
+        100
+    )
+
+    if risk >= 70:
+
+        severity = "HIGH"
+
+    elif risk >= 40:
+
+        severity = "MEDIUM"
+
+    else:
+
+        severity = "LOW"
+
+    if collision_detected:
+
+        status = "POSSIBLE INCIDENT"
+
+    elif risk >= 40:
+
+        status = "WARNING"
+
+    else:
+
+        status = "NORMAL"
+
+    if reasons:
+
+        reason = "; ".join(reasons)
+
+    else:
+
+        reason = (
+            "No abnormal traffic behaviour detected"
+        )
+
+    return (
+        risk,
+        severity,
+        status,
+        reason,
+    )
+
+
+# ============================================================
 # LIVE CAMERA CALLBACK
 # ============================================================
 
@@ -180,10 +288,6 @@ def video_frame_callback(frame):
     image = frame.to_ndarray(
         format="bgr24"
     )
-
-    # --------------------------------------------------------
-    # YOLO + ByteTrack
-    # --------------------------------------------------------
 
     try:
 
@@ -217,7 +321,7 @@ def video_frame_callback(frame):
     vehicles = []
 
     # --------------------------------------------------------
-    # READ TRACKED VEHICLES
+    # Read tracked vehicles
     # --------------------------------------------------------
 
     if (
@@ -273,7 +377,7 @@ def video_frame_callback(frame):
     vehicle_count = len(vehicles)
 
     # --------------------------------------------------------
-    # STOPPED VEHICLE DETECTION
+    # Stopped vehicles
     # --------------------------------------------------------
 
     stopped_count = 0
@@ -295,7 +399,7 @@ def video_frame_callback(frame):
 
                 movement += distance(
                     positions[i - 1],
-                    positions[i],
+                    positions[i]
                 )
 
             if movement < 25:
@@ -303,12 +407,14 @@ def video_frame_callback(frame):
                 stopped_count += 1
 
     # --------------------------------------------------------
-    # POSSIBLE COLLISION
+    # Persistent overlap
     # --------------------------------------------------------
 
     collision_detected = False
 
-    for i in range(len(vehicles)):
+    for i in range(
+        len(vehicles)
+    ):
 
         for j in range(
             i + 1,
@@ -326,7 +432,7 @@ def video_frame_callback(frame):
 
             overlap = calculate_iou(
                 vehicles[i]["box"],
-                vehicles[j]["box"],
+                vehicles[j]["box"]
             )
 
             if overlap > 0.15:
@@ -342,94 +448,22 @@ def video_frame_callback(frame):
                 collision_detected = True
 
     # --------------------------------------------------------
-    # RISK ENGINE
+    # Risk
     # --------------------------------------------------------
 
-    risk = 0
-
-    reasons = []
-
-    if vehicle_count >= 4:
-
-        risk += 20
-
-        reasons.append(
-            "High vehicle density"
-        )
-
-    if vehicle_count >= 6:
-
-        risk += 15
-
-        reasons.append(
-            "Heavy traffic"
-        )
-
-    if stopped_count > 0:
-
-        risk += stopped_count * 10
-
-        reasons.append(
-            "Stopped vehicle detected"
-        )
-
-    if collision_detected:
-
-        risk += 40
-
-        reasons.append(
-            "Persistent vehicle overlap"
-        )
-
-    risk = min(
+    (
         risk,
-        100
+        severity,
+        status,
+        reason,
+    ) = calculate_risk(
+        vehicle_count,
+        stopped_count,
+        collision_detected,
     )
 
     # --------------------------------------------------------
-    # SEVERITY
-    # --------------------------------------------------------
-
-    if risk >= 70:
-
-        severity = "HIGH"
-
-    elif risk >= 40:
-
-        severity = "MEDIUM"
-
-    else:
-
-        severity = "LOW"
-
-    # --------------------------------------------------------
-    # INCIDENT STATUS
-    # --------------------------------------------------------
-
-    if collision_detected:
-
-        status = "POSSIBLE INCIDENT"
-
-    elif risk >= 40:
-
-        status = "WARNING"
-
-    else:
-
-        status = "NORMAL"
-
-    if reasons:
-
-        reason = "; ".join(reasons)
-
-    else:
-
-        reason = (
-            "No abnormal traffic behaviour detected"
-        )
-
-    # --------------------------------------------------------
-    # UPDATE LIVE STATE
+    # Save state
     # --------------------------------------------------------
 
     with state.lock:
@@ -442,7 +476,7 @@ def video_frame_callback(frame):
         state.reason = reason
 
     # --------------------------------------------------------
-    # DRAW INFORMATION ON VIDEO
+    # Overlay
     # --------------------------------------------------------
 
     lines = [
@@ -477,10 +511,351 @@ def video_frame_callback(frame):
 
 
 # ============================================================
-# ROUTING ENGINE
+# DEMO VIDEO ANALYSIS
 # ============================================================
 
-def build_route_map():
+def run_demo_analysis(
+    controlled_incident=False,
+):
+
+    if not os.path.exists(DEMO_VIDEO):
+
+        return {
+            "success": False,
+            "error": f"Video not found: {DEMO_VIDEO}",
+        }
+
+    cap = cv2.VideoCapture(
+        DEMO_VIDEO
+    )
+
+    if not cap.isOpened():
+
+        return {
+            "success": False,
+            "error": "Could not open demo video.",
+        }
+
+    # Local tracking state for this run
+    history = defaultdict(
+        lambda: deque(maxlen=8)
+    )
+
+    overlap_frames = defaultdict(int)
+
+    unique_ids = set()
+
+    max_vehicle_count = 0
+    max_stopped_count = 0
+
+    collision_detected = False
+
+    frames_processed = 0
+
+    best_risk = -1
+    best_frame = None
+    best_reason = ""
+
+    max_frames = 300
+
+    preview = st.empty()
+    progress = st.progress(0)
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        frames_processed += 1
+
+        if frames_processed > max_frames:
+            break
+
+        try:
+
+            results = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                conf=0.35,
+                verbose=False,
+            )
+
+        except Exception as error:
+
+            cap.release()
+
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+        result = results[0]
+
+        output = result.plot()
+
+        vehicles = []
+
+        if (
+            result.boxes is not None
+            and result.boxes.id is not None
+        ):
+
+            ids = (
+                result.boxes.id
+                .int()
+                .cpu()
+                .tolist()
+            )
+
+            classes = (
+                result.boxes.cls
+                .int()
+                .cpu()
+                .tolist()
+            )
+
+            boxes = (
+                result.boxes.xyxy
+                .cpu()
+                .tolist()
+            )
+
+            for track_id, class_id, box in zip(
+                ids,
+                classes,
+                boxes,
+            ):
+
+                class_name = result.names[class_id]
+
+                if class_name not in VEHICLES:
+                    continue
+
+                unique_ids.add(
+                    track_id
+                )
+
+                centre = center_of(box)
+
+                history[track_id].append(
+                    centre
+                )
+
+                vehicles.append(
+                    {
+                        "id": track_id,
+                        "box": box,
+                    }
+                )
+
+        vehicle_count = len(vehicles)
+
+        max_vehicle_count = max(
+            max_vehicle_count,
+            vehicle_count
+        )
+
+        # ----------------------------------------------------
+        # Stopped vehicles
+        # ----------------------------------------------------
+
+        stopped_count = 0
+
+        for vehicle in vehicles:
+
+            positions = history[
+                vehicle["id"]
+            ]
+
+            if len(positions) >= 6:
+
+                movement = 0
+
+                for i in range(
+                    1,
+                    len(positions)
+                ):
+
+                    movement += distance(
+                        positions[i - 1],
+                        positions[i]
+                    )
+
+                if movement < 25:
+
+                    stopped_count += 1
+
+        max_stopped_count = max(
+            max_stopped_count,
+            stopped_count
+        )
+
+        # ----------------------------------------------------
+        # Overlap
+        # ----------------------------------------------------
+
+        for i in range(
+            len(vehicles)
+        ):
+
+            for j in range(
+                i + 1,
+                len(vehicles)
+            ):
+
+                pair = tuple(
+                    sorted(
+                        (
+                            vehicles[i]["id"],
+                            vehicles[j]["id"],
+                        )
+                    )
+                )
+
+                overlap = calculate_iou(
+                    vehicles[i]["box"],
+                    vehicles[j]["box"]
+                )
+
+                if overlap > 0.15:
+
+                    overlap_frames[pair] += 1
+
+                else:
+
+                    overlap_frames[pair] = 0
+
+                if overlap_frames[pair] >= 5:
+
+                    collision_detected = True
+
+        # ----------------------------------------------------
+        # Risk for current frame
+        # ----------------------------------------------------
+
+        (
+            frame_risk,
+            frame_severity,
+            frame_status,
+            frame_reason,
+        ) = calculate_risk(
+            vehicle_count,
+            stopped_count,
+            collision_detected,
+        )
+
+        if frame_risk > best_risk:
+
+            best_risk = frame_risk
+            best_frame = output.copy()
+            best_reason = frame_reason
+
+        # ----------------------------------------------------
+        # Preview
+        # ----------------------------------------------------
+
+        if frames_processed % 5 == 0:
+
+            preview.image(
+                cv2.cvtColor(
+                    output,
+                    cv2.COLOR_BGR2RGB,
+                ),
+                caption=(
+                    f"Processing frame "
+                    f"{frames_processed}/{max_frames}"
+                ),
+                use_container_width=True,
+            )
+
+        progress.progress(
+            min(
+                frames_processed / max_frames,
+                1.0,
+            )
+        )
+
+    cap.release()
+
+    # --------------------------------------------------------
+    # Final result
+    # --------------------------------------------------------
+
+    (
+        risk,
+        severity,
+        status,
+        reason,
+    ) = calculate_risk(
+        max_vehicle_count,
+        max_stopped_count,
+        collision_detected,
+    )
+
+    # --------------------------------------------------------
+    # Controlled incident demonstration
+    # --------------------------------------------------------
+
+    if controlled_incident:
+
+        risk = max(
+            risk,
+            70,
+        )
+
+        severity = "HIGH"
+
+        status = "CONTROLLED INCIDENT DEMO"
+
+        if reason:
+            reason += "; "
+
+        reason += (
+            "Controlled prototype incident scenario"
+        )
+
+    # --------------------------------------------------------
+    # Save result
+    # --------------------------------------------------------
+
+    result_data = {
+        "success": True,
+        "frames": frames_processed,
+        "unique_vehicles": len(unique_ids),
+        "max_vehicles": max_vehicle_count,
+        "max_stopped": max_stopped_count,
+        "collision": collision_detected,
+        "risk": risk,
+        "severity": severity,
+        "status": status,
+        "reason": reason,
+        "controlled_incident": controlled_incident,
+    }
+
+    with state.lock:
+
+        state.demo_result = result_data
+        state.vehicle_count = max_vehicle_count
+        state.stopped_count = max_stopped_count
+        state.risk = risk
+        state.severity = severity
+        state.status = status
+        state.reason = reason
+        state.demo_frame = best_frame
+
+    return result_data
+
+
+# ============================================================
+# ROUTE MAP
+# ============================================================
+
+def build_route_map(
+    incident_active=True,
+):
 
     graph = nx.Graph()
 
@@ -508,7 +883,6 @@ def build_route_map():
     source = "A"
     destination = "D"
 
-    # Normal route
     normal_route = nx.shortest_path(
         graph,
         source,
@@ -523,43 +897,45 @@ def build_route_map():
         weight="weight",
     )
 
-    # Block B-C
-    blocked_road = ("B", "C")
+    if incident_active:
 
-    if graph.has_edge(
-        blocked_road[0],
-        blocked_road[1]
-    ):
+        blocked_road = ("B", "C")
 
         graph.remove_edge(
             blocked_road[0],
-            blocked_road[1]
+            blocked_road[1],
         )
 
-    # Alternative route
-    alternative_route = nx.shortest_path(
-        graph,
-        source,
-        destination,
-        weight="weight",
-    )
+        alternative_route = nx.shortest_path(
+            graph,
+            source,
+            destination,
+            weight="weight",
+        )
 
-    alternative_distance = nx.shortest_path_length(
-        graph,
-        source,
-        destination,
-        weight="weight",
-    )
+        alternative_distance = nx.shortest_path_length(
+            graph,
+            source,
+            destination,
+            weight="weight",
+        )
+
+    else:
+
+        blocked_road = None
+        alternative_route = normal_route
+        alternative_distance = normal_distance
 
     fig = go.Figure()
 
-    # --------------------------------------------------------
     # Base roads
-    # --------------------------------------------------------
-
     for u, v, _ in roads:
 
-        if {u, v} == set(blocked_road):
+        if (
+            incident_active
+            and
+            {u, v} == set(blocked_road)
+        ):
             continue
 
         fig.add_trace(
@@ -579,10 +955,7 @@ def build_route_map():
             )
         )
 
-    # --------------------------------------------------------
     # Normal route
-    # --------------------------------------------------------
-
     for i in range(
         len(normal_route) - 1
     ):
@@ -601,48 +974,16 @@ def build_route_map():
                     positions[v][1],
                 ],
                 mode="lines",
-                line=dict(width=8),
+                line=dict(width=7),
                 name="Normal Route",
                 hoverinfo="skip",
             )
         )
 
-    # --------------------------------------------------------
-    # Blocked road
-    # --------------------------------------------------------
+    # Incident road
+    if incident_active:
 
-    u, v = blocked_road
-
-    fig.add_trace(
-        go.Scatter(
-            x=[
-                positions[u][0],
-                positions[v][0],
-            ],
-            y=[
-                positions[u][1],
-                positions[v][1],
-            ],
-            mode="lines",
-            line=dict(
-                width=10,
-                dash="dash",
-            ),
-            name="Incident / Blocked Road",
-            hoverinfo="skip",
-        )
-    )
-
-    # --------------------------------------------------------
-    # Alternative route
-    # --------------------------------------------------------
-
-    for i in range(
-        len(alternative_route) - 1
-    ):
-
-        u = alternative_route[i]
-        v = alternative_route[i + 1]
+        u, v = blocked_road
 
         fig.add_trace(
             go.Scatter(
@@ -655,16 +996,41 @@ def build_route_map():
                     positions[v][1],
                 ],
                 mode="lines",
-                line=dict(width=8),
-                name="Alternative Route",
+                line=dict(
+                    width=10,
+                    dash="dash",
+                ),
+                name="Incident / Blocked Road",
                 hoverinfo="skip",
             )
         )
 
-    # --------------------------------------------------------
-    # Nodes
-    # --------------------------------------------------------
+        # Alternative route
+        for i in range(
+            len(alternative_route) - 1
+        ):
 
+            u = alternative_route[i]
+            v = alternative_route[i + 1]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        positions[u][0],
+                        positions[v][0],
+                    ],
+                    y=[
+                        positions[u][1],
+                        positions[v][1],
+                    ],
+                    mode="lines",
+                    line=dict(width=8),
+                    name="Alternative Route",
+                    hoverinfo="skip",
+                )
+            )
+
+    # Nodes
     fig.add_trace(
         go.Scatter(
             x=[
@@ -687,12 +1053,12 @@ def build_route_map():
     fig.update_layout(
         title="AEGIS-X Geographic Intelligence",
         xaxis=dict(
-            showgrid=False,
             visible=False,
+            showgrid=False,
         ),
         yaxis=dict(
-            showgrid=False,
             visible=False,
+            showgrid=False,
         ),
         template="plotly_white",
         height=560,
@@ -704,24 +1070,14 @@ def build_route_map():
         normal_distance,
         alternative_route,
         alternative_distance,
-        blocked_road,
     )
 
 
 # ============================================================
-# GEMINI AI INCIDENT REPORT
+# GEMINI INCIDENT REPORT
 # ============================================================
 
-def generate_ai_report(
-    status,
-    risk,
-    severity,
-    vehicle_count,
-    stopped_count,
-    reason,
-    blocked_road,
-    alternative_route,
-):
+def generate_ai_report():
 
     api_key = get_gemini_key()
 
@@ -732,13 +1088,51 @@ def generate_ai_report(
             "GEMINI_API_KEY not found."
         )
 
+    with state.lock:
+
+        status = state.status
+        risk = state.risk
+        severity = state.severity
+        vehicle_count = state.vehicle_count
+        stopped_count = state.stopped_count
+        reason = state.reason
+        demo_result = state.demo_result
+
+    incident_active = (
+        status in (
+            "POSSIBLE INCIDENT",
+            "WARNING",
+            "CONTROLLED INCIDENT DEMO",
+        )
+    )
+
+    if incident_active:
+
+        blocked_road = "B-C"
+        alternative_route = "A-E-D"
+
+    else:
+
+        blocked_road = "None"
+        alternative_route = "No rerouting required"
+
+    scenario_note = ""
+
+    if demo_result and demo_result.get(
+        "controlled_incident"
+    ):
+
+        scenario_note = (
+            "This is a controlled prototype incident "
+            "demonstration, not a verified real accident."
+        )
+
     prompt = f"""
 You are the AEGIS-X Incident Commander.
 
-The following information was generated by the
-AEGIS-X deterministic processing system:
+System-generated information:
 
-Incident Status: {status}
+Status: {status}
 Risk Score: {risk}/100
 Severity: {severity}
 Vehicles Detected: {vehicle_count}
@@ -747,9 +1141,9 @@ Reason: {reason}
 Blocked Road: {blocked_road}
 Alternative Route: {alternative_route}
 
-Generate a concise incident intelligence report.
+{scenario_note}
 
-Include:
+Generate a concise incident intelligence report with:
 
 1. Incident Summary
 2. Why It Was Flagged
@@ -757,11 +1151,10 @@ Include:
 4. Route Recommendation
 
 Rules:
-
 - Use only the supplied information.
 - Do not invent casualties.
 - Do not invent locations.
-- Do not invent sensor values.
+- Do not invent sensor readings.
 - Do not invent facts.
 - Do not make medical decisions.
 - Do not make safety-critical decisions.
@@ -804,13 +1197,10 @@ Rules:
 
                     last_error = error
 
-                    error_text = str(error)
-
-                    # Retry temporary service errors
                     if (
-                        "503" in error_text
+                        "503" in str(error)
                         or
-                        "UNAVAILABLE" in error_text
+                        "UNAVAILABLE" in str(error)
                     ):
 
                         time.sleep(
@@ -821,18 +1211,16 @@ Rules:
 
                         break
 
-            # Try next model if first model failed
-
         return (
             None,
-            f"Gemini temporarily unavailable: {last_error}"
+            f"Gemini unavailable: {last_error}",
         )
 
     except Exception as error:
 
         return (
             None,
-            str(error)
+            str(error),
         )
 
 
@@ -851,9 +1239,9 @@ st.caption(
 )
 
 st.write(
-    "AEGIS-X combines real-time computer vision, "
-    "incident intelligence, risk assessment, "
-    "geographic routing and Generative AI response."
+    "AEGIS-X combines computer vision, incident "
+    "intelligence, risk assessment, geographic "
+    "routing and Generative AI response."
 )
 
 
@@ -917,21 +1305,6 @@ st.sidebar.write(
 
 
 # ============================================================
-# WEBRTC CONFIGURATION
-# ============================================================
-
-RTC_CONFIGURATION = {
-    "iceServers": [
-        {
-            "urls": [
-                "stun:stun.l.google.com:19302"
-            ]
-        }
-    ]
-}
-
-
-# ============================================================
 # REVIEW 3 — TASK 5
 # ============================================================
 
@@ -964,40 +1337,40 @@ if st.sidebar.button(
 
     else:
 
-        edge_result = run_edge_case(
+        result = run_edge_case(
             edge_case
         )
 
         st.sidebar.markdown(
-            f"**Test:** {edge_result['title']}"
+            f"**Test:** {result['title']}"
         )
 
-        if edge_result["level"] == "ERROR":
+        if result["level"] == "ERROR":
 
             st.sidebar.error(
-                edge_result["message"]
+                result["message"]
             )
 
-        elif edge_result["level"] == "WARNING":
+        elif result["level"] == "WARNING":
 
             st.sidebar.warning(
-                edge_result["message"]
+                result["message"]
             )
 
         else:
 
             st.sidebar.info(
-                edge_result["message"]
+                result["message"]
             )
 
         st.sidebar.write(
             f"**Safe Action:** "
-            f"{edge_result['action']}"
+            f"{result['action']}"
         )
 
         st.sidebar.success(
             f"**System Status:** "
-            f"{edge_result['status']}"
+            f"{result['status']}"
         )
 
 
@@ -1005,9 +1378,10 @@ if st.sidebar.button(
 # MAIN TABS
 # ============================================================
 
-tab_live, tab_map, tab_ai = st.tabs(
+tab_live, tab_demo, tab_map, tab_ai = st.tabs(
     [
         "🎥 Live Detection",
+        "🎞️ Demo Road Video",
         "🗺️ Geographic Intelligence",
         "🤖 AI Commander",
     ]
@@ -1015,7 +1389,7 @@ tab_live, tab_map, tab_ai = st.tabs(
 
 
 # ============================================================
-# TAB 1 — LIVE DETECTION
+# TAB 1 — LIVE CAMERA
 # ============================================================
 
 with tab_live:
@@ -1025,14 +1399,25 @@ with tab_live:
     )
 
     st.write(
-        "Start the browser camera. "
-        "AEGIS-X detects and tracks vehicles "
-        "and calculates a prototype incident risk."
+        "Use the browser camera for live YOLO26n "
+        "and ByteTrack processing."
     )
 
-    # --------------------------------------------------------
-    # Browser camera
-    # --------------------------------------------------------
+    st.warning(
+        "For the public deployment, camera connectivity "
+        "depends on the browser/network WebRTC connection. "
+        "Use Demo Road Video as the reliable backup."
+    )
+
+    RTC_CONFIGURATION = {
+        "iceServers": [
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302"
+                ]
+            }
+        ]
+    }
 
     webrtc_streamer(
         key="aegis-camera",
@@ -1046,10 +1431,6 @@ with tab_live:
     )
 
     st.markdown("---")
-
-    # --------------------------------------------------------
-    # Live metrics
-    # --------------------------------------------------------
 
     @st.fragment(run_every="1s")
     def show_live_metrics():
@@ -1069,46 +1450,46 @@ with tab_live:
 
             st.metric(
                 "Vehicles",
-                vehicle_count
+                vehicle_count,
             )
 
         with col2:
 
             st.metric(
                 "Stopped",
-                stopped_count
+                stopped_count,
             )
 
         with col3:
 
             st.metric(
                 "Risk Score",
-                f"{risk}/100"
+                f"{risk}/100",
             )
 
         with col4:
 
             st.metric(
                 "Severity",
-                severity
+                severity,
             )
 
         if status == "POSSIBLE INCIDENT":
 
             st.error(
-                f"🚨 AEGIS-X STATUS: {status}"
+                f"🚨 {status}"
             )
 
         elif status == "WARNING":
 
             st.warning(
-                f"⚠️ AEGIS-X STATUS: {status}"
+                f"⚠️ {status}"
             )
 
         elif status == "PROCESSING ERROR":
 
             st.error(
-                "❌ AEGIS-X PROCESSING ERROR"
+                f"❌ {status}"
             )
 
         else:
@@ -1123,56 +1504,175 @@ with tab_live:
 
     show_live_metrics()
 
-    # --------------------------------------------------------
-    # Current decision
-    # --------------------------------------------------------
 
-    st.markdown("---")
+# ============================================================
+# TAB 2 — DEMO ROAD VIDEO
+# ============================================================
 
-    st.subheader(
-        "Current Decision"
+with tab_demo:
+
+    st.header(
+        "🎞️ Demo Road Video"
     )
 
-    with state.lock:
+    st.write(
+        "Reliable backup input for the public prototype. "
+        "The video is processed on the AEGIS-X server using "
+        "YOLO26n and ByteTrack."
+    )
 
-        current_status = state.status
-        current_risk = state.risk
-        current_severity = state.severity
+    if os.path.exists(DEMO_VIDEO):
 
-    if current_status in (
-        "POSSIBLE INCIDENT",
-        "WARNING",
-    ):
-
-        st.warning(
-            "Incident intelligence activated."
+        st.video(
+            DEMO_VIDEO
         )
 
-        st.write(
-            "**Affected Road:** B-C"
+        demo_mode = st.radio(
+            "Analysis Mode",
+            [
+                "Automatic Analysis",
+                "Controlled Incident Demo",
+            ],
+            horizontal=True,
         )
 
-        st.write(
-            "**Recommended Alternative:** "
-            "A → E → D"
+        st.caption(
+            "Controlled Incident Demo is a simulated "
+            "scenario for demonstrating the downstream "
+            "route and AI response. It is not claimed "
+            "as a real accident detection."
         )
 
-        st.write(
-            f"**Decision:** {current_status} | "
-            f"Risk {current_risk}/100 | "
-            f"Severity {current_severity}"
-        )
+        if st.button(
+            "▶ Run AEGIS-X Video Analysis",
+            type="primary",
+        ):
+
+            controlled = (
+                demo_mode
+                == "Controlled Incident Demo"
+            )
+
+            with st.spinner(
+                "Running YOLO26n + ByteTrack analysis..."
+            ):
+
+                result = run_demo_analysis(
+                    controlled_incident=controlled
+                )
+
+            if result["success"]:
+
+                st.success(
+                    "AEGIS-X video analysis completed."
+                )
+
+            else:
+
+                st.error(
+                    result["error"]
+                )
+
+        # ----------------------------------------------------
+        # Show last result
+        # ----------------------------------------------------
+
+        with state.lock:
+
+            result = state.demo_result
+            demo_frame = state.demo_frame
+
+        if result:
+
+            st.markdown("---")
+
+            st.subheader(
+                "Analysis Result"
+            )
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+
+                st.metric(
+                    "Frames",
+                    result["frames"],
+                )
+
+            with col2:
+
+                st.metric(
+                    "Unique Vehicles",
+                    result["unique_vehicles"],
+                )
+
+            with col3:
+
+                st.metric(
+                    "Risk Score",
+                    f"{result['risk']}/100",
+                )
+
+            with col4:
+
+                st.metric(
+                    "Severity",
+                    result["severity"],
+                )
+
+            if result["controlled_incident"]:
+
+                st.warning(
+                    "Controlled incident scenario active."
+                )
+
+            elif result["status"] == "POSSIBLE INCIDENT":
+
+                st.error(
+                    "Possible incident indicated by "
+                    "the prototype rule engine."
+                )
+
+            elif result["status"] == "WARNING":
+
+                st.warning(
+                    "Traffic warning indicated."
+                )
+
+            else:
+
+                st.success(
+                    "No abnormal incident condition "
+                    "indicated by the prototype rules."
+                )
+
+            st.write(
+                f"**Reason:** {result['reason']}"
+            )
+
+            if demo_frame is not None:
+
+                st.subheader(
+                    "AI Detection Snapshot"
+                )
+
+                st.image(
+                    cv2.cvtColor(
+                        demo_frame,
+                        cv2.COLOR_BGR2RGB,
+                    ),
+                    use_container_width=True,
+                )
 
     else:
 
-        st.info(
-            "No active incident decision. "
-            "System continues monitoring."
+        st.error(
+            f"Demo video not found: {DEMO_VIDEO}"
         )
 
 
 # ============================================================
-# TAB 2 — GEOGRAPHIC INTELLIGENCE
+# TAB 3 — GEOGRAPHIC INTELLIGENCE
 # ============================================================
 
 with tab_map:
@@ -1181,71 +1681,81 @@ with tab_map:
         "🗺️ Geographic Intelligence"
     )
 
-    st.write(
-        "AEGIS-X identifies an affected road segment "
-        "and demonstrates alternative route selection."
+    with state.lock:
+
+        current_status = state.status
+
+    incident_active = (
+        current_status in (
+            "POSSIBLE INCIDENT",
+            "WARNING",
+            "CONTROLLED INCIDENT DEMO",
+        )
     )
 
     (
-        route_figure,
+        figure,
         normal_route,
         normal_distance,
         alternative_route,
         alternative_distance,
-        blocked_road,
-    ) = build_route_map()
+    ) = build_route_map(
+        incident_active=incident_active
+    )
 
     st.plotly_chart(
-        route_figure,
+        figure,
         use_container_width=True,
     )
 
-    col1, col2, col3 = st.columns(3)
+    if incident_active:
 
-    with col1:
+        col1, col2, col3 = st.columns(3)
 
-        st.metric(
-            "Affected Road",
-            "B-C"
+        with col1:
+
+            st.metric(
+                "Affected Road",
+                "B-C",
+            )
+
+        with col2:
+
+            st.metric(
+                "Normal Route",
+                "A-B-C-D",
+            )
+
+        with col3:
+
+            st.metric(
+                "Alternative Route",
+                "A-E-D",
+            )
+
+        st.success(
+            "Incident condition → B-C blocked → "
+            "traffic diverted through A → E → D."
         )
 
-    with col2:
+    else:
 
-        st.metric(
-            "Normal Distance",
-            str(normal_distance)
+        st.info(
+            "No active incident. Normal route remains available."
         )
 
-    with col3:
-
-        st.metric(
-            "Alternative Distance",
-            str(alternative_distance)
+        st.write(
+            "**Normal Route:** "
+            + " → ".join(normal_route)
         )
-
-    st.write(
-        "**Normal Route:** "
-        + " → ".join(normal_route)
-    )
-
-    st.write(
-        "**Alternative Route:** "
-        + " → ".join(alternative_route)
-    )
-
-    st.success(
-        "Incident scenario: B-C is blocked. "
-        "Traffic is diverted through A → E → D."
-    )
 
     st.caption(
-        "Prototype digital road graph; "
-        "not live GPS navigation."
+        "Prototype digital road graph; not live GPS navigation."
     )
 
 
 # ============================================================
-# TAB 3 — AI INCIDENT COMMANDER
+# TAB 4 — AI COMMANDER
 # ============================================================
 
 with tab_ai:
@@ -1255,54 +1765,44 @@ with tab_ai:
     )
 
     st.write(
-        "Gemini converts the deterministic AEGIS-X "
-        "decision into an explainable response."
+        "Gemini converts AEGIS-X system-generated "
+        "information into an explainable response."
     )
-
-    # --------------------------------------------------------
-    # Current live state
-    # --------------------------------------------------------
 
     with state.lock:
 
-        live_status = state.status
-        live_risk = state.risk
-        live_severity = state.severity
-        live_vehicle_count = state.vehicle_count
-        live_stopped_count = state.stopped_count
-        live_reason = state.reason
+        current_status = state.status
+        current_risk = state.risk
+        current_severity = state.severity
+        current_vehicle_count = state.vehicle_count
+        current_stopped_count = state.stopped_count
+        current_reason = state.reason
 
     st.info(
-        f"Live State: {live_status} | "
-        f"Risk: {live_risk}/100 | "
-        f"Severity: {live_severity}"
+        f"Current State: {current_status} | "
+        f"Risk: {current_risk}/100 | "
+        f"Severity: {current_severity}"
     )
 
-    # --------------------------------------------------------
-    # System-generated incident data
-    # --------------------------------------------------------
-
-    incident_text = (
-        f"Incident Status: {live_status}\n"
-        f"Risk Score: {live_risk}/100\n"
-        f"Severity: {live_severity}\n"
-        f"Vehicles Detected: {live_vehicle_count}\n"
-        f"Stopped Vehicles: {live_stopped_count}\n"
-        f"Reason: {live_reason}\n"
-        f"Blocked Road: B-C\n"
-        f"Alternative Route: A-E-D"
+    incident_data = (
+        f"Status: {current_status}\n"
+        f"Risk Score: {current_risk}/100\n"
+        f"Severity: {current_severity}\n"
+        f"Vehicles Detected: {current_vehicle_count}\n"
+        f"Stopped Vehicles: {current_stopped_count}\n"
+        f"Reason: {current_reason}\n"
+        f"Blocked Road: "
+        f"{'B-C' if current_status in ('POSSIBLE INCIDENT', 'WARNING', 'CONTROLLED INCIDENT DEMO') else 'None'}\n"
+        f"Alternative Route: "
+        f"{'A-E-D' if current_status in ('POSSIBLE INCIDENT', 'WARNING', 'CONTROLLED INCIDENT DEMO') else 'No rerouting required'}"
     )
 
     st.text_area(
         "System-generated Incident Data",
-        value=incident_text,
+        value=incident_data,
         height=220,
         disabled=True,
     )
-
-    # --------------------------------------------------------
-    # Generate AI report
-    # --------------------------------------------------------
 
     if st.button(
         "🤖 Generate AI Incident Report",
@@ -1313,16 +1813,7 @@ with tab_ai:
             "Generating incident intelligence..."
         ):
 
-            report, error = generate_ai_report(
-                status=live_status,
-                risk=live_risk,
-                severity=live_severity,
-                vehicle_count=live_vehicle_count,
-                stopped_count=live_stopped_count,
-                reason=live_reason,
-                blocked_road="B-C",
-                alternative_route="A-E-D",
-            )
+            report, error = generate_ai_report()
 
         if report:
 
@@ -1337,72 +1828,67 @@ with tab_ai:
         else:
 
             st.error(
-                f"Gemini unavailable: {error}"
+                error
             )
-
-    # --------------------------------------------------------
-    # End-to-end architecture
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    st.subheader(
-        "AEGIS-X End-to-End Flow"
-    )
-
-    st.markdown(
-        """
-        **INPUT**
-
-        🎥 Live Browser Camera
-
-        ↓
-
-        **PROCESSING**
-
-        YOLO26n + ByteTrack
-
-        ↓
-
-        **DECISION**
-
-        Incident Analysis + Risk + Severity
-
-        ↓
-
-        **GEOGRAPHIC ACTION**
-
-        Affected Road → Alternative Route
-
-        ↓
-
-        **GENERATIVE RESPONSE**
-
-        Gemini Incident Commander
-
-        ↓
-
-        **OUTPUT**
-
-        Explainable Emergency Intelligence Report
-        """
-    )
 
 
 # ============================================================
-# REVIEW 3 — TASK 5 SUMMARY
+# TASK 6 FLOW
+# ============================================================
+
+st.markdown("---")
+
+st.subheader(
+    "🔄 Review 3 — Task 6 End-to-End Flow"
+)
+
+st.markdown(
+    """
+**INPUT**
+
+🎥 Live Camera **or** 🎞️ `road.mp4`
+
+↓
+
+**PROCESSING**
+
+YOLO26n + ByteTrack
+
+↓
+
+**DECISION**
+
+Vehicle behaviour → Risk Score → Severity
+
+↓
+
+**GEOGRAPHIC ACTION**
+
+Affected Road → Alternative Route
+
+↓
+
+**GENERATIVE RESPONSE**
+
+Gemini Incident Commander
+
+↓
+
+**OUTPUT**
+
+Explainable Emergency Intelligence Report
+"""
+)
+
+
+# ============================================================
+# TASK 5 SUMMARY
 # ============================================================
 
 st.markdown("---")
 
 st.subheader(
     "🛡️ Review 3 — Task 5: Edge-Case Handling"
-)
-
-st.write(
-    "AEGIS-X is designed to respond to abnormal "
-    "conditions using fallback, safe-state, retry "
-    "and input-validation behaviour."
 )
 
 col1, col2, col3, col4 = st.columns(4)
@@ -1418,21 +1904,21 @@ with col2:
 
     st.info(
         "**No Detection**\n\n"
-        "Continue monitoring in NORMAL state."
+        "Continue monitoring normally."
     )
 
 with col3:
 
     st.info(
-        "**AI Failure**\n\n"
-        "Retry Gemini and continue core processing."
+        "**Gemini Failure**\n\n"
+        "Retry and preserve core processing."
     )
 
 with col4:
 
     st.info(
         "**Invalid Input**\n\n"
-        "Reject safely and request valid input."
+        "Reject safely."
     )
 
 
@@ -1455,12 +1941,12 @@ st.caption(
 )
 
 st.caption(
-    "AI Emergency & Geographic Intelligence System | "
+    "AEGIS-X | AI Emergency & Geographic Intelligence System | "
     "Detect. Understand. Respond."
 )
 
 st.caption(
-    "Prototype note: incident and routing decisions "
-    "are deterministic prototype logic. Gemini is used "
-    "for explanation and response generation."
+    "Prototype note: risk and routing rules are deterministic "
+    "prototype logic. Gemini provides explanation and response "
+    "text. Controlled incident mode is explicitly simulated."
 )
