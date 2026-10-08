@@ -1,0 +1,10 @@
+streamlit==1.65.0
+streamlit-webrtc==0.78.1
+ultralytics==8.4.174
+opencv-python==5.0.0.93
+numpy==2.5.3
+networkx
+plotly
+python-dotenv
+google-genai
+av
