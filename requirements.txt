@@ -8,3 +8,4 @@ plotly
 python-dotenv
 google-genai
 av
+lap==0.5.13
